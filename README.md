@@ -18,6 +18,8 @@ Created Transmart tree values to model the following CDM v3 tables
 Missing tables, issues representing them in the tree
 --Encounter --PCORNET_TRIAL --HARVEST --PRO_CM
 
+Example of how our CDM tree appears in transmart
+![diagnosis tree with dates obfuscated](https://cloud.githubusercontent.com/assets/16839412/17255910/2398d7a0-5589-11e6-9493-253a5d1406a4.jpg)
 
 Limitations –
 
