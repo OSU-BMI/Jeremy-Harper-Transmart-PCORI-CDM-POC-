@@ -1,0 +1,451 @@
+Stage 1 - Setup Transmart
+Stage 2 - Create PCORI CDM v3 database in the transmart database (This was for our stand alone system)
+Stage 3 - Import PCORI database into postgres. You might note we had our TSV files stored in our home directory for user transmart. 
+Then we created a data directory with the traditional clinical structure for import. This was because we started with the traditional loaders first.
+
+copy pcori_cdmv3.demographic from '/home/transmart/data/clinical/DEMOGRAPHIC.txt' DELIMITER E'\t' CSV HEADER;
+copy pcori_cdmv3.encounter from '/home/transmart/data/clinical/ENCOUNTER.txt' DELIMITER E'\t' CSV HEADER;
+copy pcori_cdmv3.death from '/home/transmart/data/clinical/DEATH.txt' DELIMITER E'\t' CSV HEADER;
+copy pcori_cdmv3.death_cause from '/home/transmart/data/clinical/DEATH_CAUSE.txt' DELIMITER E'\t' CSV HEADER;
+copy pcori_cdmv3.dispensing from '/home/transmart/data/clinical/DISPENSING.txt' DELIMITER E'\t' CSV HEADER;
+copy pcori_cdmv3.condition from '/home/transmart/data/clinical/CONDITION.txt' DELIMITER E'\t' CSV HEADER;
+copy pcori_cdmv3.procedures from '/home/transmart/data/clinical/PROCEDURE.txt' DELIMITER E'\t' CSV HEADER;
+copy pcori_cdmv3.diagnosis from '/home/transmart/data/clinical/DIAGNOSIS.txt' DELIMITER E'\t' CSV HEADER;
+copy pcori_cdmv3.lab_result_cm from '/home/transmart/data/clinical/LAB_RESULT_CM.txt' DELIMITER E'\t' CSV HEADER;
+copy pcori_cdmv3.prescribing from '/home/transmart/data/clinical/PRESCRIBING.txt' DELIMITER E'\t' CSV HEADER;
+copy pcori_cdmv3.vital from '/home/transmart/data/clinical/VITAL.txt' DELIMITER E'\t' CSV HEADER;
+
+Stage 4 - Run the ETL to populate transmart, **I recommend running each script alone**
+notes:
+1. I found postgres spent more time calculating the most efficient method to import than it did importing. Yes there are methods to force it to do so but I didn't implement those
+2. I attempted to write down the length of time it took when I was doing the transform (I was inconsistant).
+3. Because we are part of the LHSNET PCORI group I chose to name my study LHSNET
+
+DROP INDEX i2b2demodata.idx_count_concept_path;
+DROP INDEX i2b2demodata.cd_uploadid_idx;
+DROP INDEX i2b2demodata.fact_modifier_patient;
+DROP INDEX i2b2demodata.idx_fact_concept;
+DROP INDEX i2b2demodata.idx_fact_cpe;
+DROP INDEX i2b2demodata.idx_fact_patient_num;
+DROP INDEX i2b2demodata.idx_count_concept_path;
+DROP TRIGGER trg_encounter_num ON i2b2demodata.observation_fact;
+DROP TRIGGER trg_concept_dimension_cd ON i2b2demodata.concept_dimension;
+
+
+--INSERT INTO STATEMENTS: 29s for first
+insert into i2b2demodata.patient_dimension (patient_num, birth_date, death_date, sex_cd, age_in_years_num, race_cd) select a.patid, birth_date, b.death_date, sex,date_part('year',age(birth_date)) as age, raw_race 
+from pcori_cdmv3.demographic as a
+LEFT JOIN pcori_cdmv3.death as b on a.patid=b.patid
+group by a.patid, b.death_date;
+
+vacuum analyze i2b2demodata.patient_dimension;
+
+--4 seconds
+insert into i2b2demodata.patient_trial (patient_num, trial, secure_obj_token) select patid, 'LHSNET', 'EXP:PUBLIC'
+from pcori_cdmv3.demographic
+group by patid;
+vacuum analyze i2b2demodata.patient_trail;
+
+
+--create temp table for processing
+Create TEMP table temp_ob_fact (encounter_num varchar, patient_num varchar, sample_cd varchar, start_date varchar, tval_char varchar, valtype_cd varchar, instance_num varchar, provider_id varchar, modifier_cd varchar);
+
+
+--Demographic birthdate
+--22s
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select patid, patid
+, '\Public Studies\LHSNET\Demographic\BirthDate\'|| EXTRACT(Year FROM a.birth_date) || '\' || EXTRACT(Month FROM a.birth_date)
+, birth_date, '', 'T', '1', '@', birth_date
+from pcori_cdmv3.demographic as a
+group by a.patid, EXTRACT(Year FROM a.birth_date), EXTRACT(Month FROM a.birth_date);
+
+--demographic sex 23s
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select patient_num, patient_num
+, '\Public Studies\LHSNET\Demographic\Sex\' || sex_cd
+, birth_date, '', 'T', '1', '@', sex_cd
+from i2b2demodata.patient_dimension as a;
+
+--demographic Race 24s
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select patient_num, patient_num
+, '\Public Studies\LHSNET\Demographic\Race\' || race_cd
+, birth_date, '', 'T', '1', '@', race_cd
+from i2b2demodata.patient_dimension as a;
+
+--Demographic Hispanic 3 seconds
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select a.patid, a.patid, '\Public Studies\LHSNET\Demographic\Hispanic\' || raw_hispanic
+, birth_date, '', 'T', '1', '@', raw_hispanic
+from pcori_cdmv3.demographic as a
+group by a.patid;
+
+--Condition 11s
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select a.patid, a.patid, '\Public Studies\LHSNET\Condition\' || 'ICD' || a.condition_type || '\' || substring(condition,0,4) || '\' || a.condition || '\' || EXTRACT(Year FROM a.report_date) || '\' || EXTRACT(Month FROM a.report_date), a.report_date, '', 'T', '1', '@', a.conditionid
+from pcori_cdmv3.condition as a
+group by a.conditionid, a.patid, a.condition_type, a.condition, a.report_date;
+
+--death condition (Death) - Need to add a death statement similar to birth date much smaller number have conditions
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select a.patid, a.patid, '\Public Studies\LHSNET\Demographic\Death Status\' || 'ICD' || a.death_cause_code || '\' || substring(a.death_cause,0,4) || '\' || a.death_cause || '\' || EXTRACT(Year FROM b.death_date) || '\' || EXTRACT(Month FROM b.death_date), b.death_date, '', 'T', '1', '@', death_cause
+from pcori_cdmv3.death_cause as a
+LEFT JOIN pcori_cdmv3.death as b on a.patid=b.patid 
+group by a.patid, a.death_cause, a.death_cause_code, b.death_date;
+
+
+--diagnosis 111s for ~11m rows
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select a.encounterid, a.patid, '\Public Studies\LHSNET\Diagnosis\' || 'ICD' || a.dx_type || '\' || substring(dx,0,4) || '\' || a.dx || '\' || EXTRACT(Year FROM a.admit_date) || '\' || EXTRACT(Month FROM a.admit_date), a.admit_date, '', 'T', '1', '@', a.diagnosisid
+from pcori_cdmv3.diagnosis as a;
+--group by a.diagnosisid, a.encounterid, a.patid, a.report_date, a.resolve_date;
+
+--procedures
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select a.patid, a.patid, '\Public Studies\LHSNET\Procedures\' || 'ICD' || a.px_type || '\' || substring(px,0,4) || '\' || a.px || '\' || EXTRACT(Year FROM a.admit_date) || '\' || EXTRACT(Month FROM a.admit_date), a.admit_date, '', 'T', '1', '@', a.proceduresid
+from pcori_cdmv3.procedures as a
+group by a.patid, a.px, a.admit_date, a.proceduresid;
+
+--lab_result_cm
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select a.patid, a.patid, '\Public Studies\LHSNET\Lab Name\' || substring(lab_name,0,4) || '\' || a.lab_name || '\' || EXTRACT(Year FROM a.result_date) || '\' || EXTRACT(Month FROM a.result_date) ||'\' || a.result_num, a.result_num, '', 'T', '1', '@', a.lab_result_cm_id
+from pcori_cdmv3.lab_result_cm as a
+group by a.patid, a.lab_name, a.result_num, a.result_date, a.lab_result_cm_id;
+
+
+--prescribing -Opportunity for enhancement, refilles, quantity etc 113s
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select a.encounterid, a.patid, '\Public Studies\LHSNET\Prescibed Drugs\'  || substring(raw_rx_frequency,0,4) || '\' || a.raw_rx_frequency || '\' || EXTRACT(Year FROM a.rx_start_date) || '\' || EXTRACT(Month FROM a.rx_start_date), a.rx_start_date, '', 'T', '1', '@', a.prescribingid
+from pcori_cdmv3.prescribing as a;
+--group by a.prescibingid, a.encounterid, a.patid, a.report_date, a.resolve_date;
+
+--Dispensing -Opportunity for enhancement, add supply and amount at some point 14s
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select a.patid, a.patid, '\Public Studies\LHSNET\Dispensed Drugs\' || 'NDC' || substring(NDC,0,4) || '\' || a.NDC || '\' || EXTRACT(Year FROM a.dispense_date) || '\' || EXTRACT(Month FROM a.dispense_date), a.dispense_date, '', 'T', '1', '@', a.dispensingid
+from pcori_cdmv3.dispensing as a
+group by a.patid, a.NDC, a.dispense_date, a.dispensingid;
+
+--Vital Height 98s
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select a.patid, a.patid, '\Public Studies\LHSNET\Vital\Height (Inches)\' || a.ht || '\' || EXTRACT(Year FROM a.measure_date) || '\' || EXTRACT(Month FROM a.measure_date), a.measure_date, '', 'T', '1', '@', a.vitalid || 'h'
+from pcori_cdmv3.vital as a
+where a.ht is not null;
+
+--Vital Weight 147s
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select a.patid, a.patid, '\Public Studies\LHSNET\Vital\Weight (lbs)\' || a.wt || '\' || EXTRACT(Year FROM a.measure_date) || '\' || EXTRACT(Month FROM a.measure_date), a.measure_date, '', 'T', '1', '@', a.vitalid || 'w'
+from pcori_cdmv3.vital as a
+where a.wt is not null;
+
+--Vital Diastolic 255s
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select a.patid, a.patid, '\Public Studies\LHSNET\Vital\Diastolic\' || a.diastolic || '\' || EXTRACT(Year FROM a.measure_date) || '\' || EXTRACT(Month FROM a.measure_date), a.measure_date, '', 'T', '1', '@', a.vitalid || 'd'
+from pcori_cdmv3.vital as a
+where a.diastolic is not null;
+
+--Vital Systolic 255s
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select a.patid, a.patid, '\Public Studies\LHSNET\Vital\Systolic\' || a.systolic || '\' || EXTRACT(Year FROM a.measure_date) || '\' || EXTRACT(Month FROM a.measure_date), a.measure_date, '', 'T', '1', '@', a.vitalid || 's'
+from pcori_cdmv3.vital as a
+where a.systolic is not null;
+
+--Vital Original_BMI 218s
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select a.patid, a.patid, '\Public Studies\LHSNET\Vital\BMI\' || a.original_bmi || '\' || EXTRACT(Year FROM a.measure_date) || '\' || EXTRACT(Month FROM a.measure_date), a.measure_date, '', 'T', '1', '@', a.vitalid || 'b'
+from pcori_cdmv3.vital as a
+where a.original_bmi is not null;
+
+--Vital Smoking -enhance with if statements to use human language for smoking status 49s
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select a.patid, a.patid, '\Public Studies\LHSNET\Vital\Smoking\' || a.smoking || '\' || EXTRACT(Year FROM a.measure_date) || '\' || EXTRACT(Month FROM a.measure_date), a.measure_date, '', 'T', '1', '@', a.vitalid || 's'
+from pcori_cdmv3.vital as a
+where a.smoking is not null;
+
+--Vital Tabacco -same enhancement as above 79s
+insert into temp_ob_fact (encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select a.patid, a.patid, '\Public Studies\LHSNET\Vital\Tabacco\' || a.tobacco || '\' || EXTRACT(Year FROM a.measure_date) || '\' || EXTRACT(Month FROM a.measure_date), a.measure_date, '', 'T', '1', '@', a.vitalid || 'ts'
+from pcori_cdmv3.vital as a
+where a.tobacco is not null;
+
+--This is where you stop adding observation facts. (IF YOU ARE PORTING ANOTHER SCHEMA EG OMOP, you can stop mapping here, the rest should be automated)
+
+Create TEMP table temp_con_dimension (concept_cd varchar, concept_path varchar, name_char varchar);
+
+--Create concept_dimension next 1.4s
+--You could make it more efficient by populating the temp table below rather than inserting into concept_dimension
+insert into i2b2demodata.concept_dimension (name_char, concept_path)
+select substring(sample_cd,char_length(sample_cd)-position('\' in reverse(sample_cd))+2,char_length(sample_cd)), sample_cd
+from temp_ob_fact
+group by sample_cd
+order by sample_cd;
+
+--You'll need to turn off concept_dimension.concept_cd not null feature
+
+Create TEMP table temp_con_dimension (concept_cd varchar, concept_path varchar, name_char varchar);
+
+--Create concept_dimension next 1.4s
+insert into temp_con_dimension (name_char, concept_path)
+select substring(sample_cd,char_length(sample_cd)-position('\' in reverse(sample_cd))+2,char_length(sample_cd)), sample_cd
+from temp_ob_fact
+group by sample_cd
+order by sample_cd;
+
+--Iteration 1 to populate subtrees, so far you've only specified the most specific tree in observation fact.
+CREATE TEMP Table concepts as select substring(a.concept_path,0,char_length(a.concept_path)-position('\' in reverse(a.concept_path))+1) as temprow
+from temp_con_dimension as a
+LEFT JOIN temp_con_dimension as b on substring(a.concept_path,0,char_length(a.concept_path)-position('\' in reverse(a.concept_path))+1)=b.concept_path
+where b.concept_path is null
+group by temprow;
+
+Insert into temp_con_dimension (concept_path,name_char)
+select concepts.temprow, substring(concepts.temprow,char_length(concepts.temprow)-position('\' in reverse(concepts.temprow))+2,char_length(concepts.temprow))
+from concepts
+where concepts.temprow<>'';
+
+--iteration 2
+CREATE TEMP Table concepts2 as select substring(a.concept_path,0,char_length(a.concept_path)-position('\' in reverse(a.concept_path))+1) as temprow
+from temp_con_dimension as a
+LEFT JOIN temp_con_dimension as b on substring(a.concept_path,0,char_length(a.concept_path)-position('\' in reverse(a.concept_path))+1)=b.concept_path
+where b.concept_path is null
+group by temprow;
+
+Insert into temp_con_dimension (concept_path,name_char)
+select temprow, substring(temprow,char_length(temprow)-position('\' in reverse(temprow))+2,char_length(temprow))
+from concepts2
+where temprow<>'';
+
+--iteration 3 6366 rows
+CREATE TEMP Table concepts3 as select substring(a.concept_path,0,char_length(a.concept_path)-position('\' in reverse(a.concept_path))+1) as temprow
+from temp_con_dimension as a
+LEFT JOIN temp_con_dimension as b on substring(a.concept_path,0,char_length(a.concept_path)-position('\' in reverse(a.concept_path))+1)=b.concept_path
+where b.concept_path is null
+group by temprow;
+
+Insert into temp_con_dimension (concept_path,name_char)
+select temprow, substring(temprow,char_length(temprow)-position('\' in reverse(temprow))+2,char_length(temprow))
+from concepts3
+where temprow<>'';
+
+--iteration 4, 10rows
+CREATE TEMP Table concepts4 as select substring(a.concept_path,0,char_length(a.concept_path)-position('\' in reverse(a.concept_path))+1) as temprow
+from temp_con_dimension as a
+LEFT JOIN temp_con_dimension as b on substring(a.concept_path,0,char_length(a.concept_path)-position('\' in reverse(a.concept_path))+1)=b.concept_path
+where b.concept_path is null
+group by temprow;
+
+Insert into temp_con_dimension (concept_path,name_char)
+select temprow, substring(temprow,char_length(temprow)-position('\' in reverse(temprow))+2,char_length(temprow))
+from concepts4
+where temprow<>'';
+
+--iteration 5, 3rows
+CREATE TEMP Table concepts5 as select substring(a.concept_path,0,char_length(a.concept_path)-position('\' in reverse(a.concept_path))+1) as temprow
+from temp_con_dimension as a
+LEFT JOIN temp_con_dimension as b on substring(a.concept_path,0,char_length(a.concept_path)-position('\' in reverse(a.concept_path))+1)=b.concept_path
+where b.concept_path is null
+group by temprow;
+
+Insert into temp_con_dimension (concept_path,name_char)
+select temprow, substring(temprow,char_length(temprow)-position('\' in reverse(temprow))+2,char_length(temprow))
+from concepts5
+where temprow<>'';
+
+--iteration 6, 0rows
+CREATE TEMP Table concepts6 as select substring(a.concept_path,0,char_length(a.concept_path)-position('\' in reverse(a.concept_path))+1) as temprow
+from temp_con_dimension as a
+LEFT JOIN temp_con_dimension as b on substring(a.concept_path,0,char_length(a.concept_path)-position('\' in reverse(a.concept_path))+1)=b.concept_path
+where b.concept_path is null
+group by temprow;
+
+Insert into temp_con_dimension (concept_path,name_char)
+select temprow, substring(temprow,char_length(temprow)-position('\' in reverse(temprow))+2,char_length(temprow))
+from concepts6
+where temprow<>'';
+
+
+--Note you'll want to create all tree values above prior to running the below to populate all concept values, keep iterating above until you also get 0 rows returned ~41seconds
+insert into i2b2demodata.concept_dimension (concept_cd, concept_path, name_char)
+select row_number() OVER () as concept_cd, concept_path, name_char
+from temp_con_dimension
+where concept_path is not null;
+
+--populate concept_CD ID number into observation fact 1027s
+insert into i2b2demodata.observation_fact (concept_cd, encounter_num, patient_num, sample_cd, start_date, tval_char, valtype_cd, instance_num, provider_id, modifier_cd)
+select b.concept_cd, a.encounter_num, a.patient_num, a.sample_cd, cast(a.start_date as date), a.tval_char, a.valtype_cd, a.instance_num, a.provider_id, a.modifier_cd
+from temp_ob_fact as a
+LEFT JOIN i2b2demodata.concept_dimension as b on a.sample_cd=b.concept_path
+where b.concept_cd is not null;
+
+DISCARD TEMP;
+--371737 ms.
+vacuum analyze i2b2demodata.observation_fact;
+
+--Populate concept counts table. 116s
+insert into i2b2demodata.concept_counts (patient_count,concept_path,parent_concept_path)
+select count(*),sample_cd, substring(sample_cd,0,char_length(sample_cd)-position('\' in reverse(sample_cd))+1)
+from i2b2demodata.observation_fact
+group by sample_cd;
+
+--This creates the subcounts, you'll need to run it multiple times to create all subtrees. it took 4 tries 2.4s
+insert into i2b2demodata.concept_counts (concept_path,parent_concept_path,patient_count)
+select a.parent_concept_path, substring(a.parent_concept_path,0,char_length(a.parent_concept_path)-position('\' in reverse(a.parent_concept_path))+1), case when SUM(a.patient_count)>(select count(*) from pcori_cdmv3.demographic) then (select count(*) from pcori_cdmv3.demographic) else SUM(a.patient_count) end
+from i2b2demodata.concept_counts as a 
+LEFT JOIN i2b2demodata.concept_counts as b on a.parent_concept_path=b.concept_path
+where b.parent_concept_path is null 
+group by a.parent_concept_path;
+
+--Itteration 2  1.8 s 
+insert into i2b2demodata.concept_counts (concept_path,parent_concept_path,patient_count)
+select a.parent_concept_path, substring(a.parent_concept_path,0,char_length(a.parent_concept_path)-position('\' in reverse(a.parent_concept_path))+1), case when SUM(a.patient_count)>(select count(*) from pcori_cdmv3.demographic) then (select count(*) from pcori_cdmv3.demographic) else SUM(a.patient_count) end
+from i2b2demodata.concept_counts as a 
+LEFT JOIN i2b2demodata.concept_counts as b on a.parent_concept_path=b.concept_path
+where b.parent_concept_path is null 
+group by a.parent_concept_path;
+
+--itteration 3 1.7s
+insert into i2b2demodata.concept_counts (concept_path,parent_concept_path,patient_count)
+select a.parent_concept_path, substring(a.parent_concept_path,0,char_length(a.parent_concept_path)-position('\' in reverse(a.parent_concept_path))+1), case when SUM(a.patient_count)>(select count(*) from pcori_cdmv3.demographic) then (select count(*) from pcori_cdmv3.demographic) else SUM(a.patient_count) end
+from i2b2demodata.concept_counts as a 
+LEFT JOIN i2b2demodata.concept_counts as b on a.parent_concept_path=b.concept_path
+where b.parent_concept_path is null 
+group by a.parent_concept_path;
+
+--Itteration 4 1.9s
+insert into i2b2demodata.concept_counts (concept_path,parent_concept_path,patient_count)
+select a.parent_concept_path, substring(a.parent_concept_path,0,char_length(a.parent_concept_path)-position('\' in reverse(a.parent_concept_path))+1), case when SUM(a.patient_count)>(select count(*) from pcori_cdmv3.demographic) then (select count(*) from pcori_cdmv3.demographic) else SUM(a.patient_count) end
+from i2b2demodata.concept_counts as a 
+LEFT JOIN i2b2demodata.concept_counts as b on a.parent_concept_path=b.concept_path
+where b.parent_concept_path is null 
+group by a.parent_concept_path;
+
+--itteration 5  0 rows affected
+insert into i2b2demodata.concept_counts (concept_path,parent_concept_path,patient_count)
+select a.parent_concept_path, substring(a.parent_concept_path,0,char_length(a.parent_concept_path)-position('\' in reverse(a.parent_concept_path))+1), case when SUM(a.patient_count)>(select count(*) from pcori_cdmv3.demographic) then (select count(*) from pcori_cdmv3.demographic) else SUM(a.patient_count) end
+from i2b2demodata.concept_counts as a 
+LEFT JOIN i2b2demodata.concept_counts as b on a.parent_concept_path=b.concept_path
+where b.parent_concept_path is null 
+group by a.parent_concept_path;
+
+--itteration 6
+insert into i2b2demodata.concept_counts (concept_path,parent_concept_path,patient_count)
+select a.parent_concept_path, substring(a.parent_concept_path,0,char_length(a.parent_concept_path)-position('\' in reverse(a.parent_concept_path))+1), case when SUM(a.patient_count)>(select count(*) from pcori_cdmv3.demographic) then (select count(*) from pcori_cdmv3.demographic) else SUM(a.patient_count) end
+from i2b2demodata.concept_counts as a 
+LEFT JOIN i2b2demodata.concept_counts as b on a.parent_concept_path=b.concept_path
+where b.parent_concept_path is null 
+group by a.parent_concept_path;
+
+--itteration 7
+insert into i2b2demodata.concept_counts (concept_path,parent_concept_path,patient_count)
+select a.parent_concept_path, substring(a.parent_concept_path,0,char_length(a.parent_concept_path)-position('\' in reverse(a.parent_concept_path))+1), case when SUM(a.patient_count)>(select count(*) from pcori_cdmv3.demographic) then (select count(*) from pcori_cdmv3.demographic) else SUM(a.patient_count) end
+from i2b2demodata.concept_counts as a 
+LEFT JOIN i2b2demodata.concept_counts as b on a.parent_concept_path=b.concept_path
+where b.parent_concept_path is null 
+group by a.parent_concept_path;
+
+--itteration 8
+insert into i2b2demodata.concept_counts (concept_path,parent_concept_path,patient_count)
+select a.parent_concept_path, substring(a.parent_concept_path,0,char_length(a.parent_concept_path)-position('\' in reverse(a.parent_concept_path))+1), case when SUM(a.patient_count)>(select count(*) from pcori_cdmv3.demographic) then (select count(*) from pcori_cdmv3.demographic) else SUM(a.patient_count) end
+from i2b2demodata.concept_counts as a 
+LEFT JOIN i2b2demodata.concept_counts as b on a.parent_concept_path=b.concept_path
+where b.parent_concept_path is null 
+group by a.parent_concept_path;
+
+--loading metadata, it was easier to write above SQL without the extra \ and insert back in later. Transmart Tree's don't appear without the \, 19s
+UPDATE i2b2demodata.concept_dimension as a
+SET concept_path=b.concept_path || '\'
+FROM i2b2demodata.concept_dimension as b
+WHERE a.concept_path=b.concept_path;
+
+
+UPDATE i2b2demodata.concept_counts as a
+SET concept_path=b.concept_path || '\'
+FROM i2b2demodata.concept_counts as b
+WHERE a.concept_path=b.concept_path;
+
+
+UPDATE i2b2demodata.concept_counts as a
+SET parent_concept_path=b.parent_concept_path || '\'
+FROM i2b2demodata.concept_counts as b
+WHERE a.concept_path=b.concept_path;
+
+--1.2 seconds LA stands for final node, FA stands for folder, FAS seems to be main trunk? 251s execution time.
+insert into i2b2metadata.i2b2 (c_hlevel, c_fullname, c_name, c_synonym_cd, c_visualattributes, c_basecode, c_facttablecolumn, c_tablename, c_columnname, c_columndatatype, c_operator, c_dimcode, c_comment, c_tooltip, m_applied_path,update_date)
+select length(a.concept_path)-length(replace(a.concept_path,'\',''))-2 as c_hlevel, a.concept_path, b.name_char, 'N', 'LA', b.concept_cd, 'CONCEPT_CD', 'CONCEPT_DIMENSION', 'CONCEPT_PATH', 'T', 'LIKE', a.concept_path, 'trial:LHSNET', a.concept_path, '@', '01-01-2010'
+from i2b2demodata.concept_counts as a
+LEFT JOIN i2b2demodata.concept_dimension as b on a.concept_path=b.concept_path
+LEFT JOIN i2b2demodata.concept_counts as c on a.concept_path=c.parent_concept_path
+where (length(a.concept_path)-length(replace(a.concept_path,'\',''))-2 is not null) 
+and b.name_char is not null and (c.concept_path is null)
+group by a.concept_path, b.name_char, b.concept_cd,a.parent_concept_path
+order by c_hlevel;
+
+insert into i2b2metadata.i2b2 (c_hlevel, c_fullname, c_name, c_synonym_cd, c_visualattributes, c_basecode, c_facttablecolumn, c_tablename, c_columnname, c_columndatatype, c_operator, c_dimcode, c_comment, c_tooltip, m_applied_path,update_date)
+select length(a.concept_path)-length(replace(a.concept_path,'\',''))-2 as c_hlevel, a.concept_path, b.name_char, 'N', 'FA', b.concept_cd, 'CONCEPT_CD', 'CONCEPT_DIMENSION', 'CONCEPT_PATH', 'T', 'LIKE', a.concept_path, 'trial:LHSNET', a.concept_path, '@', '01-01-2010'
+from i2b2demodata.concept_counts as a
+LEFT JOIN i2b2demodata.concept_dimension as b on a.concept_path=b.concept_path
+LEFT JOIN i2b2demodata.concept_counts as c on a.concept_path=c.parent_concept_path
+where (length(a.concept_path)-length(replace(a.concept_path,'\',''))-2 is not null) 
+and b.name_char is not null and (c.concept_path is not null)
+group by a.concept_path, b.name_char, b.concept_cd,a.parent_concept_path
+order by c_hlevel;
+
+--Optimization opportunity you could write an update to change top two layers to FAS.
+--insert into i2b2metadata.i2b2 (c_hlevel, c_fullname, c_name, c_synonym_cd, c_visualattributes, c_facttablecolumn, c_tablename, c_columnname, c_columndatatype, c_operator, c_dimcode, c_comment, c_tooltip, m_applied_path, sourcesystem_cd, valuetype_cd, m_exclusion_cd, c_path, c_symbol,update_date)
+--VALUES (0, '\Public Studies\', 'Public Studies', 'N', 'FAS', 'CONCEPT_CD', 'CONCEPT_DIMENSION', 'CONCEPT_PATH', 'T', 'LIKE', '\Public Studies\', 'trial:LHSNET', '\Public Studies\', '@', '', 'LHSNET', '', '','','01-01-2010');
+
+
+--DO NOT RUN THESE TOGETHER, I left postgres running for hours with no result and after I ran by hand it was far less time. Suspected compilation error.
+--Indexes took Query returned successfully with no result in 86s.
+CREATE INDEX fact_modifier_patient
+  ON i2b2demodata.observation_fact
+  USING btree
+  (modifier_cd COLLATE pg_catalog."default", patient_num)
+TABLESPACE indx;
+
+--Query returned successfully with no result in 2210s.
+CREATE INDEX idx_fact_concept
+  ON i2b2demodata.observation_fact
+  USING btree
+  (concept_cd COLLATE pg_catalog."default")
+TABLESPACE indx;
+
+--Query returned successfully with no result in 2574s.
+CREATE INDEX idx_fact_cpe
+  ON i2b2demodata.observation_fact
+  USING btree
+  (concept_cd COLLATE pg_catalog."default", patient_num, encounter_num)
+TABLESPACE indx;
+
+CREATE INDEX idx_fact_patient_num
+  ON i2b2demodata.observation_fact
+  USING btree
+  (patient_num)
+TABLESPACE indx;
+
+CREATE INDEX cd_uploadid_idx
+  ON i2b2demodata.concept_dimension
+  USING btree
+  (upload_id)
+TABLESPACE indx;
+
+CREATE INDEX idx_count_concept_path
+  ON i2b2demodata.concept_counts
+  USING btree
+  (concept_path COLLATE pg_catalog."default")
+TABLESPACE indx;
+
+CREATE TRIGGER trg_encounter_num
+  BEFORE INSERT
+  ON i2b2demodata.observation_fact
+  FOR EACH ROW
+  EXECUTE PROCEDURE i2b2demodata.tf_trg_encounter_num();
+ALTER TABLE i2b2demodata.observation_fact DISABLE TRIGGER trg_encounter_num;
+
+CREATE TRIGGER trg_concept_dimension_cd
+  BEFORE INSERT
+  ON i2b2demodata.concept_dimension
+  FOR EACH ROW
+  EXECUTE PROCEDURE i2b2demodata.tf_trg_concept_dimension_cd();
+ALTER TABLE i2b2demodata.concept_dimension DISABLE TRIGGER trg_concept_dimension_cd;
+
